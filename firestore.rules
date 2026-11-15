@@ -1,0 +1,194 @@
+rules_version = '2';
+
+// Firebase Konsolu → Firestore Database → Rules sekmesine yapıştırıp "Publish" deyin.
+// Yetki kararlarının TAMAMI burada, sunucuda verilir. Tarayıcı kodu değiştirilse bile aşağıdaki kurallar aşılamaz.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Yardımcı fonksiyonlar ----------
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+
+    // KURUCU: "owners/{uid}" belgesi olan hesap. Bu koleksiyona istemciden YAZILAMAZ;
+    // belgeyi yalnızca siz Firebase Konsolundan oluşturabilirsiniz.
+    function isOwner() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/owners/$(request.auth.uid));
+    }
+
+    function me() {
+      return get(userPath(request.auth.uid)).data;
+    }
+
+    function isBanned() {
+      return me().banned == true;
+    }
+
+    // MODERATÖR: yalnızca mesaj silebilir. Ban / rol / içerik yönetimi yetkisi YOKTUR.
+    function isMod() {
+      return signedIn() && me().role == 'moderator' && me().banned != true;
+    }
+
+    // İÇERİĞİ GÖREBİLEN: giriş yapmış + e-postası doğrulanmış + banlı olmayan hesap (veya Kurucu).
+    function canView() {
+      return isOwner()
+        || (signedIn()
+            && request.auth.token.email_verified == true
+            && exists(userPath(request.auth.uid))
+            && me().banned != true);
+    }
+
+    function validName(n) {
+      return n is string && n.size() >= 2 && n.size() <= 24 && !n.matches('.*[<>].*');
+    }
+
+    // Opsiyonel metin alanı: yoksa serbest, varsa string ve en fazla 'max' karakter
+    function optStr(d, k, max) {
+      return !(k in d) || (d[k] is string && d[k].size() <= max);
+    }
+
+    function baseOk(d) {
+      return d.keys().hasAll(['type', 'title', 'createdAt', 'createdBy'])
+        && d.title is string && d.title.size() >= 1 && d.title.size() <= 100
+        && optStr(d, 'description', 500)
+        && optStr(d, 'category', 30)
+        && d.createdAt == request.time
+        && d.createdBy == request.auth.uid;
+    }
+
+    // İçerik belgesi doğrulaması (tür başına izin verilen alanlar sabit)
+    function contentOk(d, id) {
+      let base = ['type', 'title', 'description', 'category', 'createdAt', 'createdBy'];
+      let fileKeys = ['fileName', 'mime', 'size', 'hasData'];
+      return baseOk(d) && (
+        (d.type == 'prompt'
+          && d.keys().hasOnly(base.concat(['text']))
+          && d.keys().hasAll(['text'])
+          && d.text is string && d.text.size() >= 1 && d.text.size() <= 8000)
+        ||
+        (d.type == 'link'
+          && d.keys().hasOnly(base.concat(['url']))
+          && d.keys().hasAll(['url'])
+          && d.url is string && d.url.size() <= 500
+          && d.url.matches('https://[^\\s]+'))
+        ||
+        (d.type == 'video'
+          && d.keys().hasOnly(base.concat(['videoId']))
+          && d.keys().hasAll(['videoId'])
+          && d.videoId is string && d.videoId.matches('[A-Za-z0-9_-]{11}'))
+        ||
+        ((d.type == 'image' || d.type == 'file')
+          && d.keys().hasOnly(base.concat(fileKeys))
+          && d.keys().hasAll(fileKeys)
+          && d.fileName is string && d.fileName.size() >= 1 && d.fileName.size() <= 120
+          && d.mime is string && d.mime.size() <= 100
+          && (d.type == 'file' || d.mime in ['image/jpeg', 'image/png', 'image/webp'])
+          && d.size is int && d.size > 0 && d.size <= 700000
+          && d.hasData == true
+          && existsAfter(/databases/$(database)/documents/contentData/$(id)))
+      );
+    }
+
+    // ---------- Kurucu kaydı: sadece kendi belgesini okuyabilir, kimse yazamaz ----------
+    match /owners/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow write: if false;
+    }
+
+    // ---------- Kullanıcı profilleri ----------
+    match /users/{userId} {
+      allow get: if signedIn() && (request.auth.uid == userId || isOwner());
+      allow list: if isOwner();
+
+      // Kayıt: herkes yalnızca KENDİ belgesini, sadece 'user' rolü ve banned=false ile oluşturabilir.
+      allow create: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.keys().hasOnly(['displayName', 'email', 'role', 'banned', 'createdAt', 'lastPostAt'])
+        && request.resource.data.keys().hasAll(['displayName', 'email', 'role', 'banned', 'createdAt', 'lastPostAt'])
+        && validName(request.resource.data.displayName)
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.role == 'user'
+        && request.resource.data.banned == false
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.lastPostAt == request.time;
+
+      allow update: if
+        // (a) Üye kendi 'lastPostAt' alanını güncelleyebilir (yalnızca bu alan; en az 30 sn arayla) → hız sınırı
+        (signedIn()
+          && request.auth.uid == userId
+          && resource.data.banned == false
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastPostAt'])
+          && request.resource.data.lastPostAt == request.time
+          && request.time > resource.data.lastPostAt + duration.value(30, 's'))
+        ||
+        // (b) SADECE Kurucu: başkasının rolünü (user/moderator) ve ban durumunu değiştirebilir
+        (isOwner()
+          && userId != request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role', 'banned'])
+          && request.resource.data.role in ['user', 'moderator']
+          && request.resource.data.banned is bool);
+
+      allow delete: if false;   // banlı kullanıcı profilini silip sıfırdan başlayamasın
+    }
+
+    // ---------- İçerik (prompt / resim / dosya / video / link) ----------
+    // Okuma: giriş + doğrulanmış e-posta. Yazma/silme: SADECE Kurucu.
+    match /content/{contentId} {
+      allow get: if canView();
+      allow list: if canView() && request.query.limit <= 100;
+      allow create: if isOwner() && contentOk(request.resource.data, contentId);
+      allow update: if false;
+      allow delete: if isOwner();
+    }
+
+    // Ağır veri (resim/dosya içeriği, base64). Tek tek okunur, listelenemez.
+    match /contentData/{contentId} {
+      allow get: if canView();
+      allow list: if false;
+      allow create: if isOwner()
+        && request.resource.data.keys().hasOnly(['data'])
+        && request.resource.data.data is string
+        && request.resource.data.data.size() > 0
+        && request.resource.data.data.size() <= 960000
+        && getAfter(/databases/$(database)/documents/content/$(contentId)).data.hasData == true;
+      allow update: if false;
+      allow delete: if isOwner();
+    }
+
+    // ---------- Mesajlar (artık yalnızca giriş yapmış + doğrulanmış üyelere açık) ----------
+    match /messages/{messageId} {
+      allow get: if canView();
+      allow list: if canView() && request.query.limit <= 100;
+
+      allow create: if signedIn()
+        && request.auth.token.email_verified == true          // e-postası doğrulanmamış hesap yazamaz
+        && !isBanned()                                         // banlı yazamaz
+        && request.resource.data.keys().hasOnly(['uid', 'authorName', 'text', 'createdAt'])
+        && request.resource.data.keys().hasAll(['uid', 'authorName', 'text', 'createdAt'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.authorName == me().displayName // başkası adına yazılamaz
+        && request.resource.data.text is string
+        && request.resource.data.text.size() >= 1
+        && request.resource.data.text.size() <= 500
+        && request.resource.data.createdAt == request.time
+        && request.time > me().lastPostAt + duration.value(30, 's')              // sunucu taraflı hız sınırı
+        && getAfter(userPath(request.auth.uid)).data.lastPostAt == request.time;  // lastPostAt aynı işlemde güncellenmeli
+
+      // Mesajı yazan kendi mesajını; moderatör ve Kurucu herkesinkini silebilir.
+      allow delete: if signedIn()
+        && ((resource.data.uid == request.auth.uid && !isBanned())
+            || isMod()
+            || isOwner());
+
+      allow update: if false;
+    }
+
+    // Diğer her şey varsayılan olarak reddedilir.
+  }
+}
